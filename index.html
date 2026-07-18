@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>AR - Máquina 3D | Babylon.js WebXR</title>
+<script src="https://cdn.babylonjs.com/babylon.js"></script>
+<script src="https://cdn.babylonjs.com/loaders/babylonjs.loaders.min.js"></script>
+<script src="https://cdn.babylonjs.com/gui/babylon.gui.min.js"></script>
+<style>
+  html, body {
+    width: 100%; height: 100%; margin: 0; padding: 0;
+    overflow: hidden; background: #0d1117; font-family: system-ui, sans-serif;
+  }
+  #renderCanvas {
+    width: 100%; height: 100%; display: block; touch-action: none;
+  }
+
+  /* ---------- Overlay inicial (fora do AR) ---------- */
+  #introOverlay {
+    position: absolute; inset: 0; z-index: 20;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    color: #fff; text-align: center; padding: 24px; box-sizing: border-box;
+    background: radial-gradient(circle at top, #1c2530, #0d1117);
+  }
+  #introOverlay h1 { font-size: 1.4rem; margin-bottom: 8px; }
+  #introOverlay p { max-width: 480px; color: #9fb0c3; font-size: 0.9rem; line-height: 1.4; }
+  #arButtonWrap { margin-top: 20px; }
+  #statusMsg { margin-top: 14px; font-size: 0.8rem; color: #ffcc66; min-height: 20px; }
+
+  /* ---------- DOM Overlay dentro do AR ---------- */
+  #arUiOverlay {
+    position: fixed; inset: 0; pointer-events: none;
+    display: none; z-index: 30; font-family: system-ui, sans-serif;
+  }
+  #arTopBar {
+    position: absolute; top: env(safe-area-inset-top, 12px); left: 0; right: 0;
+    display: flex; justify-content: center; pointer-events: none;
+  }
+  #arHint {
+    pointer-events: none;
+    background: rgba(13,17,23,0.75); color:#fff; padding: 8px 16px;
+    border-radius: 20px; font-size: 0.8rem; backdrop-filter: blur(4px);
+  }
+  #arBottomBar {
+    position: absolute; bottom: env(safe-area-inset-bottom, 18px); left: 0; right: 0;
+    display: flex; justify-content: center; gap: 10px; flex-wrap: wrap;
+    pointer-events: auto; padding: 0 12px; box-sizing: border-box;
+  }
+  .arBtn {
+    pointer-events: auto;
+    background: rgba(13,17,23,0.85); color: #fff; border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 14px; padding: 10px 14px; font-size: 0.85rem;
+    display: flex; align-items: center; gap: 6px; backdrop-filter: blur(4px);
+  }
+  .arBtn:active { background: rgba(80,140,255,0.6); }
+  #infoPanel {
+    position: absolute; top: 60px; left: 50%; transform: translateX(-50%);
+    background: rgba(13,17,23,0.85); color: #fff; padding: 10px 16px; border-radius: 10px;
+    font-size: 0.8rem; max-width: 260px; text-align: center; pointer-events: none; display: none;
+  }
+  #lightBadge {
+    position: absolute; top: env(safe-area-inset-top, 12px); right: 12px;
+    background: rgba(13,17,23,0.75); color:#ffd27a; padding: 6px 10px; border-radius: 10px;
+    font-size: 0.7rem; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="renderCanvas"></canvas>
+
+<!-- Overlay inicial -->
+<div id="introOverlay">
+  <h1>🛠️ Máquina em Realidade Aumentada</h1>
+  <p>
+    Aponte a câmera para uma superfície plana (chão ou mesa), toque para posicionar
+    o modelo 3D e use os gestos para girar, escalar e interagir com ele.
+    Requer um navegador compatível com WebXR AR (ex: Chrome no Android) e conexão HTTPS.
+  </p>
+  <div id="arButtonWrap"></div>
+  <div id="statusMsg"></div>
+</div>
+
+<!-- DOM Overlay usado durante a sessão AR -->
+<div id="arUiOverlay">
+  <div id="arTopBar"><div id="arHint">Toque numa superfície para posicionar a máquina</div></div>
+  <div id="lightBadge">☀️ luz: --</div>
+  <div id="infoPanel"></div>
+  <div id="arBottomBar">
+    <div class="arBtn" id="btnScaleDown">➖ Escala</div>
+    <div class="arBtn" id="btnScaleUp">➕ Escala</div>
+    <div class="arBtn" id="btnRotate">🔄 Girar</div>
+    <div class="arBtn" id="btnAddCopy">➕ Nova cópia</div>
+    <div class="arBtn" id="btnReset">🗑️ Limpar</div>
+    <div class="arBtn" id="btnPlanes">📐 Planos</div>
+  </div>
+</div>
+
+<script>
+(async () => {
+  const canvas = document.getElementById("renderCanvas");
+  const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
+  const scene = new BABYLON.Scene(engine);
+
+  // ---------------------------------------------------------------
+  // 1) CENA BASE (usada também como fallback fora do modo AR)
+  // ---------------------------------------------------------------
+  const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI / 2, Math.PI / 2.5, 3, BABYLON.Vector3.Zero(), scene);
+  camera.attachControl(canvas, true);
+  camera.lowerRadiusLimit = 0.3;
+  camera.wheelPrecision = 60;
+
+  const hemiLight = new BABYLON.HemisphericLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
+  hemiLight.intensity = 1.0;
+
+  const dirLight = new BABYLON.DirectionalLight("dirLight", new BABYLON.Vector3(-0.5, -1, -0.3), scene);
+  dirLight.intensity = 0.6;
+
+  // Ambiente simples para pré-visualização normal (não aparece em AR)
+  const previewGround = BABYLON.MeshBuilder.CreateGround("previewGround", { width: 6, height: 6 }, scene);
+  const gridMat = new BABYLON.StandardMaterial("gridMat", scene);
+  gridMat.diffuseColor = new BABYLON.Color3(0.15, 0.18, 0.22);
+  gridMat.alpha = 0.6;
+  previewGround.material = gridMat;
+
+  // ---------------------------------------------------------------
+  // 2) IMPORTAR O MODELO GLB
+  // ---------------------------------------------------------------
+  const statusMsg = document.getElementById("statusMsg");
+  statusMsg.textContent = "Carregando modelo 3D...";
+
+  let originalMeshes = [];
+  let modelRoot = null;
+
+  async function loadModelTemplate() {
+    const result = await BABYLON.SceneLoader.ImportMeshAsync("", "./", "maquina.glb", scene);
+    const root = new BABYLON.TransformNode("machineTemplateRoot", scene);
+    result.meshes.forEach(m => { if (!m.parent) m.parent = root; });
+    root.setEnabled(false); // template invisível, usado apenas para clonar
+    return root;
+  }
+
+  modelRoot = await loadModelTemplate();
+  statusMsg.textContent = "Modelo carregado ✔";
+
+  // Coloca uma instância de pré-visualização parada no centro (fora do AR)
+  function cloneMachine(name) {
+    const clone = modelRoot.instantiateHierarchy(null, { doNotInstantiate: true });
+    clone.name = name;
+    clone.setEnabled(true);
+    return clone;
+  }
+
+  const previewInstance = cloneMachine("previewMachine");
+  // Ajusta escala do preview com base no tamanho real do modelo
+  (function fitPreview() {
+    let min = new BABYLON.Vector3(Infinity, Infinity, Infinity);
+    let max = new BABYLON.Vector3(-Infinity, -Infinity, -Infinity);
+    previewInstance.getChildMeshes().forEach(m => {
+      const b = m.getBoundingInfo().boundingBox;
+      min = BABYLON.Vector3.Minimize(min, b.minimumWorld);
+      max = BABYLON.Vector3.Maximize(max, b.maximumWorld);
+    });
+    const size = max.subtract(min);
+    const largest = Math.max(size.x, size.y, size.z) || 1;
+    const scale = 1.5 / largest;
+    previewInstance.scaling = new BABYLON.Vector3(scale, scale, scale);
+    previewInstance.position.y = -min.y * scale;
+    camera.setTarget(BABYLON.Vector3.Zero());
+    camera.radius = 3;
+  })();
+
+  // ---------------------------------------------------------------
+  // 3) VERIFICA SUPORTE A WEBXR AR
+  // ---------------------------------------------------------------
+  const introOverlay = document.getElementById("introOverlay");
+  const arUiOverlay = document.getElementById("arUiOverlay");
+  const infoPanel = document.getElementById("infoPanel");
+  const lightBadge = document.getElementById("lightBadge");
+
+  const arAvailable = navigator.xr && await navigator.xr.isSessionSupported("immersive-ar").catch(() => false);
+
+  if (!arAvailable) {
+    statusMsg.innerHTML = "⚠️ Este navegador/dispositivo não suporta WebXR AR.<br>Veja a pré-visualização 3D abaixo (arraste para girar).";
+  }
+
+  // ---------------------------------------------------------------
+  // 4) CONFIGURAÇÃO DA EXPERIÊNCIA WebXR
+  // ---------------------------------------------------------------
+  const xrHelper = await scene.createDefaultXRExperienceAsync({
+    uiOptions: { sessionMode: "immersive-ar", referenceSpaceType: "local-floor" },
+    optionalFeatures: true,          // habilita hit-test, planos, anchors, luz, etc.
+    disableDefaultUI: false,
+    disableTeleportation: true
+  });
+
+  const fm = xrHelper.baseExperience.featuresManager;
+
+  // ---- 4.1 Hit-test: raio contra o mundo real ----
+  const hitTest = fm.enableFeature(BABYLON.WebXRHitTest.Name, "latest", {
+    entityTypes: ["plane", "mesh"]
+  });
+
+  // ---- 4.2 Detecção de planos ----
+  let planesVisible = false;
+  const planeMeshes = new Map();
+  const planeMat = new BABYLON.StandardMaterial("planeMat", scene);
+  planeMat.diffuseColor = new BABYLON.Color3(0.2, 0.7, 1);
+  planeMat.alpha = 0.25;
+  planeMat.backFaceCulling = false;
+
+  const planeDetector = fm.enableFeature(BABYLON.WebXRPlaneDetector.Name, "latest");
+  planeDetector.onPlaneAddedObservable.add(plane => {
+    plane.polygonDefinition.push(plane.polygonDefinition[0]);
+    const mesh = BABYLON.MeshBuilder.CreatePolygon("plane-" + plane.id, {
+      shape: plane.polygonDefinition.map(p => new BABYLON.Vector3(p.x, p.y, p.z))
+    }, scene);
+    mesh.material = planeMat;
+    mesh.isVisible = planesVisible;
+    plane.mesh = mesh;
+    planeMeshes.set(plane.id, mesh);
+  });
+  planeDetector.onPlaneUpdatedObservable.add(plane => {
+    const mesh = planeMeshes.get(plane.id);
+    if (mesh) mesh.dispose(false, false);
+    if (plane.polygonDefinition.length > 2) {
+      plane.polygonDefinition.push(plane.polygonDefinition[0]);
+      const newMesh = BABYLON.MeshBuilder.CreatePolygon("plane-" + plane.id, {
+        shape: plane.polygonDefinition.map(p => new BABYLON.Vector3(p.x, p.y, p.z))
+      }, scene);
+      newMesh.material = planeMat;
+      newMesh.isVisible = planesVisible;
+      newMesh.position = plane.transformationMatrix.getTranslation();
+      plane.mesh = newMesh;
+      planeMeshes.set(plane.id, newMesh);
+    }
+  });
+  planeDetector.onPlaneRemovedObservable.add(plane => {
+    const mesh = planeMeshes.get(plane.id);
+    if (mesh) mesh.dispose();
+    planeMeshes.delete(plane.id);
+  });
+
+  // ---- 4.3 Anchors: fixam objetos no mundo real ----
+  const anchorSystem = fm.enableFeature(BABYLON.WebXRAnchorSystem.Name, "latest");
+  anchorSystem.onAnchorAddedObservable.add(anchor => {
+    if (anchor._attachedNode) return; // já tratado no momento da criação
+  });
+
+  // ---- 4.4 Estimativa de luz do ambiente real ----
+  let lightEstimationFeature = null;
+  try {
+    lightEstimationFeature = fm.enableFeature(BABYLON.WebXRLightEstimation.Name, "latest", {
+      setSceneEnvironmentTexture: true,
+      createDirectionalLightSource: true
+    });
+    lightEstimationFeature.onReflectionCubeMapUpdatedObservable.add(() => {
+      lightBadge.textContent = "☀️ luz do ambiente ativa";
+    });
+  } catch (e) {
+    lightBadge.textContent = "☀️ estimativa de luz indisponível";
+  }
+
+  // ---- 4.5 DOM Overlay: nossa UI HTML dentro do AR ----
+  try {
+    fm.enableFeature(BABYLON.WebXRDomOverlay.Name, "latest", {
+      element: "#arUiOverlay"
+    });
+  } catch (e) { /* nem todo navegador suporta */ }
+
+  // ---------------------------------------------------------------
+  // 5) LÓGICA DE COLOCAÇÃO DO MODELO (hit-test + anchors)
+  // ---------------------------------------------------------------
+  let reticle = BABYLON.MeshBuilder.CreateTorus("reticle", { diameter: 0.16, thickness: 0.015 }, scene);
+  const reticleMat = new BABYLON.StandardMaterial("reticleMat", scene);
+  reticleMat.emissiveColor = new BABYLON.Color3(0.3, 1, 0.5);
+  reticleMat.disableLighting = true;
+  reticle.material = reticleMat;
+  reticle.isVisible = false;
+  reticle.rotationQuaternion = new BABYLON.Quaternion();
+
+  let lastHitPose = null;
+
+  hitTest.onHitTestResultObservable.add(results => {
+    if (results.length) {
+      reticle.isVisible = true;
+      lastHitPose = results[0];
+      results[0].transformationMatrix.decompose(undefined, reticle.rotationQuaternion, reticle.position);
+    } else {
+      reticle.isVisible = false;
+      lastHitPose = null;
+    }
+  });
+
+  const placedMachines = [];
+  let selected = null;
+
+  async function placeMachineAtReticle() {
+    if (!lastHitPose) return;
+
+    // cria âncora no ponto detectado -> objeto fica fixo no mundo real
+    const anchor = await anchorSystem.addAnchorPointUsingHitTestResultAsync(lastHitPose);
+
+    const instance = cloneMachine("machine_" + placedMachines.length);
+    instance.setEnabled(true);
+    instance.scaling = previewInstance.scaling.clone();
+
+    anchor.attachedNode = instance;
+
+    // interatividade: tocar no modelo destaca ele e mostra informações
+    instance.getChildMeshes().forEach(mesh => {
+      mesh.isPickable = true;
+      mesh.actionManager = new BABYLON.ActionManager(scene);
+      mesh.actionManager.registerAction(
+        new BABYLON.ExecuteCodeAction(BABYLON.ActionManager.OnPickTrigger, () => {
+          selectMachine(instance);
+        })
+      );
+    });
+
+    placedMachines.push(instance);
+    selectMachine(instance);
+    document.getElementById("arHint").textContent =
+      "Máquina posicionada! Toque nela p/ selecionar ou use os botões abaixo.";
+  }
+
+  function selectMachine(instance) {
+    selected = instance;
+    infoPanel.style.display = "block";
+    infoPanel.textContent = `Selecionado: ${instance.name} — use os botões para girar/escalar`;
+    placedMachines.forEach(m => highlight(m, m === instance));
+  }
+
+  function highlight(instance, on) {
+    instance.getChildMeshes().forEach(mesh => {
+      if (!mesh.material) return;
+      mesh.renderOutline = on;
+      mesh.outlineColor = new BABYLON.Color3(0.3, 1, 0.5);
+      mesh.outlineWidth = 0.003;
+    });
+  }
+
+  // Toque na tela para posicionar (fora dos botões da UI)
+  scene.onPointerObservable.add((pointerInfo) => {
+    if (pointerInfo.type === BABYLON.PointerEventTypes.POINTERTAP) {
+      if (xrHelper.baseExperience.state === BABYLON.WebXRState.IN_XR && reticle.isVisible) {
+        // só posiciona se o toque não acertou um modelo já colocado
+        const pick = pointerInfo.pickInfo;
+        const hitExisting = pick && pick.hit && placedMachines.some(m => m.getChildMeshes().includes(pick.pickedMesh));
+        if (!hitExisting) placeMachineAtReticle();
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------
+  // 6) BOTÕES DA UI (DOM Overlay) — manipulação do modelo
+  // ---------------------------------------------------------------
+  document.getElementById("btnScaleUp").onclick = () => {
+    if (!selected) return;
+    selected.scaling.scaleInPlace(1.15);
+  };
+  document.getElementById("btnScaleDown").onclick = () => {
+    if (!selected) return;
+    selected.scaling.scaleInPlace(1 / 1.15);
+  };
+  document.getElementById("btnRotate").onclick = () => {
+    if (!selected) return;
+    selected.rotate(BABYLON.Axis.Y, Math.PI / 6, BABYLON.Space.WORLD);
+  };
+  document.getElementById("btnAddCopy").onclick = () => {
+    if (lastHitPose) placeMachineAtReticle();
+    else infoPanel.textContent = "Aponte para uma superfície detectada primeiro.";
+    infoPanel.style.display = "block";
+  };
+  document.getElementById("btnReset").onclick = () => {
+    placedMachines.forEach(m => m.dispose());
+    placedMachines.length = 0;
+    selected = null;
+    infoPanel.style.display = "none";
+  };
+  document.getElementById("btnPlanes").onclick = () => {
+    planesVisible = !planesVisible;
+    planeMeshes.forEach(mesh => mesh.isVisible = planesVisible);
+  };
+
+  // Pinça com dois dedos para escalar / arrastar com um dedo para girar
+  let pointers = {};
+  let startPinchDist = null;
+  let startScale = null;
+
+  canvas.addEventListener("pointerdown", e => { pointers[e.pointerId] = { x: e.clientX, y: e.clientY }; });
+  canvas.addEventListener("pointerup", e => { delete pointers[e.pointerId]; startPinchDist = null; });
+  canvas.addEventListener("pointermove", e => {
+    if (!(e.pointerId in pointers)) return;
+    pointers[e.pointerId] = { x: e.clientX, y: e.clientY };
+    const ids = Object.keys(pointers);
+    if (ids.length === 2 && selected) {
+      const [a, b] = ids.map(id => pointers[id]);
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      if (startPinchDist === null) {
+        startPinchDist = dist;
+        startScale = selected.scaling.x;
+      } else {
+        const factor = dist / startPinchDist;
+        const newScale = BABYLON.Scalar.Clamp(startScale * factor, startScale * 0.3, startScale * 3);
+        selected.scaling = new BABYLON.Vector3(newScale, newScale, newScale);
+      }
+    } else if (ids.length === 1 && selected && xrHelper.baseExperience.state === BABYLON.WebXRState.IN_XR) {
+      // arrastar horizontalmente gira o modelo selecionado
+      const dx = e.movementX || 0;
+      selected.rotate(BABYLON.Axis.Y, dx * 0.01, BABYLON.Space.WORLD);
+    }
+  });
+
+  // ---------------------------------------------------------------
+  // 7) ENTRAR/SAIR DO MODO AR — alterna as interfaces
+  // ---------------------------------------------------------------
+  xrHelper.baseExperience.onStateChangedObservable.add(state => {
+    if (state === BABYLON.WebXRState.IN_XR) {
+      introOverlay.style.display = "none";
+      arUiOverlay.style.display = "block";
+      previewInstance.setEnabled(false);
+      previewGround.setEnabled(false);
+    } else if (state === BABYLON.WebXRState.NOT_IN_XR) {
+      introOverlay.style.display = "flex";
+      arUiOverlay.style.display = "none";
+      previewInstance.setEnabled(true);
+      previewGround.setEnabled(true);
+      reticle.isVisible = false;
+      infoPanel.style.display = "none";
+    }
+  });
+
+  // Move o botão "Entrar em AR" padrão para dentro do nosso overlay estilizado
+  const arButtonWrap = document.getElementById("arButtonWrap");
+  setTimeout(() => {
+    const nativeBtn = document.querySelector(".xr-button-overlay, button[class*='xr']");
+    if (nativeBtn) arButtonWrap.appendChild(nativeBtn);
+  }, 300);
+
+  // ---------------------------------------------------------------
+  // 8) LOOP DE RENDER
+  // ---------------------------------------------------------------
+  engine.runRenderLoop(() => scene.render());
+  window.addEventListener("resize", () => engine.resize());
+
+})();
+</script>
+</body>
+</html>
