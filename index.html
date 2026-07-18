@@ -98,7 +98,13 @@
 </div>
 
 <script>
+window.addEventListener("error", (e) => {
+  const s = document.getElementById("statusMsg");
+  if (s) s.textContent = "❌ Erro: " + e.message;
+});
+
 (async () => {
+ try {
   const canvas = document.getElementById("renderCanvas");
   const engine = new BABYLON.Engine(canvas, true, { preserveDrawingBuffer: true, stencil: true });
   const scene = new BABYLON.Scene(engine);
@@ -112,10 +118,24 @@
   camera.wheelPrecision = 60;
 
   const hemiLight = new BABYLON.HemisphericLight("hemiLight", new BABYLON.Vector3(0, 1, 0), scene);
-  hemiLight.intensity = 1.0;
+  hemiLight.intensity = 1.2;
 
   const dirLight = new BABYLON.DirectionalLight("dirLight", new BABYLON.Vector3(-0.5, -1, -0.3), scene);
-  dirLight.intensity = 0.6;
+  dirLight.intensity = 0.8;
+
+  // Fundo cinza (não preto) — assim, se algo não renderizar, dá pra diferenciar
+  // "tela vazia" (mostra o cinza) de "tela preta por falta de luz/material".
+  scene.clearColor = new BABYLON.Color4(0.08, 0.09, 0.11, 1);
+
+  // Ambiente de iluminação (IBL) — ESSENCIAL para materiais PBR/metálicos não
+  // ficarem completamente pretos (comum em modelos de máquinas/industriais).
+  try {
+    scene.createDefaultEnvironment({
+      createSkybox: false,
+      createGround: false,
+      environmentTexture: "https://assets.babylonjs.com/environments/environmentSpecular.env"
+    });
+  } catch (e) { console.warn("Ambiente IBL não carregado:", e); }
 
   // Ambiente simples para pré-visualização normal (não aparece em AR)
   const previewGround = BABYLON.MeshBuilder.CreateGround("previewGround", { width: 6, height: 6 }, scene);
@@ -124,52 +144,71 @@
   gridMat.alpha = 0.6;
   previewGround.material = gridMat;
 
+  // Render loop começa AGORA — assim a cena nunca fica "congelada" na tela,
+  // mesmo que algo abaixo (carregar modelo, configurar AR) dê erro.
+  engine.runRenderLoop(() => scene.render());
+  window.addEventListener("resize", () => engine.resize());
+
   // ---------------------------------------------------------------
   // 2) IMPORTAR O MODELO GLB
   // ---------------------------------------------------------------
   const statusMsg = document.getElementById("statusMsg");
   statusMsg.textContent = "Carregando modelo 3D...";
 
-  let originalMeshes = [];
-  let modelRoot = null;
+  // Baseline de escala/posição calculada uma única vez (a partir da 1ª cópia carregada)
+  let baselineScale = null;
+  let baselineMin = null, baselineMax = null;
 
-  async function loadModelTemplate() {
+  // Carrega uma NOVA cópia do modelo a partir do disco/cache do navegador.
+  // Evita clonar a hierarquia inteira em memória (isso travava em modelos pesados).
+  async function spawnMachine(name) {
     const result = await BABYLON.SceneLoader.ImportMeshAsync("", "./", "maquina.glb", scene);
-    const root = new BABYLON.TransformNode("machineTemplateRoot", scene);
+    const root = new BABYLON.TransformNode(name, scene);
     result.meshes.forEach(m => { if (!m.parent) m.parent = root; });
-    root.setEnabled(false); // template invisível, usado apenas para clonar
-    return root;
+
+    if (baselineScale === null) {
+      const verted = result.meshes.filter(m => m.getTotalVertices && m.getTotalVertices() > 0);
+      if (verted.length) {
+        const mm = BABYLON.Mesh.MinMax(verted);
+        baselineMin = mm.minimum ?? mm.min;
+        baselineMax = mm.maximum ?? mm.max;
+      } else {
+        baselineMin = BABYLON.Vector3.Zero();
+        baselineMax = new BABYLON.Vector3(1, 1, 1);
+      }
+      const size = baselineMax.subtract(baselineMin);
+      const largest = Math.max(size.x, size.y, size.z) || 1;
+      baselineScale = 1.5 / largest;
+    }
+    root.scaling = new BABYLON.Vector3(baselineScale, baselineScale, baselineScale);
+    return { root, meshes: result.meshes };
   }
 
-  modelRoot = await loadModelTemplate();
-  statusMsg.textContent = "Modelo carregado ✔";
+  let previewInstance = null;
+  try {
+    const spawned = await spawnMachine("previewMachine");
+    previewInstance = spawned.root;
 
-  // Coloca uma instância de pré-visualização parada no centro (fora do AR)
-  function cloneMachine(name) {
-    const clone = modelRoot.instantiateHierarchy(null, { doNotInstantiate: true });
-    clone.name = name;
-    clone.setEnabled(true);
-    return clone;
+    // Centraliza o modelo em X/Z e apoia a base dele em Y=0
+    const center = baselineMin.add(baselineMax).scale(0.5);
+    previewInstance.position.x = -center.x * baselineScale;
+    previewInstance.position.z = -center.z * baselineScale;
+    previewInstance.position.y = -baselineMin.y * baselineScale;
+
+    // Enquadra a câmera com base no tamanho real (já escalado) do modelo
+    const scaledSize = baselineMax.subtract(baselineMin).scale(baselineScale);
+    const largestScaled = Math.max(scaledSize.x, scaledSize.y, scaledSize.z, 0.2);
+    camera.setTarget(new BABYLON.Vector3(0, scaledSize.y / 2, 0));
+    camera.radius = largestScaled * 2.2;
+    camera.lowerRadiusLimit = largestScaled * 0.3;
+    camera.upperRadiusLimit = largestScaled * 8;
+
+    statusMsg.textContent = `Modelo carregado ✔ (${spawned.meshes.length} partes, ${scaledSize.x.toFixed(2)}×${scaledSize.y.toFixed(2)}×${scaledSize.z.toFixed(2)}u)`;
+  } catch (err) {
+    statusMsg.textContent = "❌ Erro ao carregar maquina.glb: " + (err.message || err);
+    console.error(err);
+    return; // não tenta seguir para o AR sem o modelo
   }
-
-  const previewInstance = cloneMachine("previewMachine");
-  // Ajusta escala do preview com base no tamanho real do modelo
-  (function fitPreview() {
-    let min = new BABYLON.Vector3(Infinity, Infinity, Infinity);
-    let max = new BABYLON.Vector3(-Infinity, -Infinity, -Infinity);
-    previewInstance.getChildMeshes().forEach(m => {
-      const b = m.getBoundingInfo().boundingBox;
-      min = BABYLON.Vector3.Minimize(min, b.minimumWorld);
-      max = BABYLON.Vector3.Maximize(max, b.maximumWorld);
-    });
-    const size = max.subtract(min);
-    const largest = Math.max(size.x, size.y, size.z) || 1;
-    const scale = 1.5 / largest;
-    previewInstance.scaling = new BABYLON.Vector3(scale, scale, scale);
-    previewInstance.position.y = -min.y * scale;
-    camera.setTarget(BABYLON.Vector3.Zero());
-    camera.radius = 3;
-  })();
 
   // ---------------------------------------------------------------
   // 3) VERIFICA SUPORTE A WEBXR AR
@@ -188,6 +227,10 @@
   // ---------------------------------------------------------------
   // 4) CONFIGURAÇÃO DA EXPERIÊNCIA WebXR
   // ---------------------------------------------------------------
+  // Isolado em seu próprio try/catch: se o AR não estiver disponível
+  // (ex: página servida em HTTP em vez de HTTPS), a pré-visualização 3D
+  // continua funcionando normalmente — só o modo AR fica desativado.
+  try {
   const xrHelper = await scene.createDefaultXRExperienceAsync({
     uiOptions: { sessionMode: "immersive-ar", referenceSpaceType: "local-floor" },
     optionalFeatures: true,          // habilita hit-test, planos, anchors, luz, etc.
@@ -298,13 +341,20 @@
 
   async function placeMachineAtReticle() {
     if (!lastHitPose) return;
+    document.getElementById("arHint").textContent = "Posicionando...";
 
     // cria âncora no ponto detectado -> objeto fica fixo no mundo real
     const anchor = await anchorSystem.addAnchorPointUsingHitTestResultAsync(lastHitPose);
 
-    const instance = cloneMachine("machine_" + placedMachines.length);
-    instance.setEnabled(true);
-    instance.scaling = previewInstance.scaling.clone();
+    let instance;
+    try {
+      const spawned = await spawnMachine("machine_" + placedMachines.length);
+      instance = spawned.root;
+    } catch (err) {
+      document.getElementById("arHint").textContent = "❌ Erro ao carregar cópia do modelo.";
+      console.error(err);
+      return;
+    }
 
     anchor.attachedNode = instance;
 
@@ -439,12 +489,22 @@
     if (nativeBtn) arButtonWrap.appendChild(nativeBtn);
   }, 300);
 
-  // ---------------------------------------------------------------
-  // 8) LOOP DE RENDER
-  // ---------------------------------------------------------------
-  engine.runRenderLoop(() => scene.render());
-  window.addEventListener("resize", () => engine.resize());
+  } catch (xrErr) {
+    console.warn("WebXR/AR indisponível:", xrErr);
+    const msg = (xrErr.message || String(xrErr)).includes("HTTPS")
+      ? "⚠️ AR precisa de HTTPS (você está em HTTP). A pré-visualização 3D abaixo funciona normalmente."
+      : "⚠️ AR indisponível neste navegador/dispositivo. A pré-visualização 3D abaixo funciona normalmente.";
+    statusMsg.innerHTML = msg;
+    return; // encerra aqui — não há AR pra configurar, mas a pré-visualização já está rodando
+  }
 
+  statusMsg.textContent = "";
+
+ } catch (err) {
+  console.error(err);
+  const s = document.getElementById("statusMsg");
+  if (s) s.textContent = "❌ Erro: " + (err.message || err);
+ }
 })();
 </script>
 </body>
